@@ -1,5 +1,7 @@
 module SeismicBSS
 
-# package code goes here
+
+include("CICA.jl")
+include("Decon.jl")
 
 end # module
