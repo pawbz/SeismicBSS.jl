@@ -10,6 +10,10 @@ module CICA
 using Distributions
 import JuMIT.Grid:M1D
 import JuMIT.Misfits
+import JuMIT.Data
+import JuMIT.Grid
+import JuMIT.DSP
+import JuMIT.Acquisition
 
 type ICA{T}
 	"blended data at receivers(nr, nt)"
@@ -31,23 +35,76 @@ type ICA{T}
 	"store dg(Wx)"
 	dgWx::Matrix{T}
 	"whitening matrix --- this is updated after preprocessing"
-	Q::Array{T}
+	Q::Array{T,3}
 	"unmixing matrix --- this is updated after ICA"
-	W::Array{T}
+	W::Array{T,3}
 	"previous unmixing matrix"
-	Wp::Array{T}
+	Wp::Array{T,3}
 	"store mean vector"
-	mv::Array{T}
+	mv::Array{T,2}
 	"real or complex ica"
 	attrib::Symbol
 	"maximum iterations"
 	maxiter::Int64
+	"receiver at which deblending happens"
+	magic_recv::Int64
 	"tolerance"
 	tol::Float64
 	"bins"
-	bins
+	bins::Vector{UnitRange{Int64}}
 end
 
+
+function ICA(dat::Data.TD; 
+	     ica_func::Function=(x,ns)->ICA(x,ns),)
+	Acquisition.Geom_isfixed(dat.acqgeom) || error("implemented only for fixed spread geom")
+	acqgeom=dat.acqgeom
+	ns=acqgeom.nss
+	nr=acqgeom.nr[1] # fixed spread
+	nt=dat.tgrid.nx
+	xx=zeros(nt, nr, ns)
+	for iss in 1:ns
+		for ir in 1:nr
+			for it in 1:nt
+				xx[it,ir,iss] = dat.d[iss,1][it,ir]
+			end
+		end
+	end
+	# real fft gves only +ve freqs
+	xx=rfft(xx, [1])
+
+	xstack=complex.(zeros(size(xx,2),size(xx,1)))
+	A=zeros(nr, ns)
+	for iss in 1:ns
+		for ir in 1:nr
+			for i in 1:size(xx,1)
+				# stack over supersources
+				xstack[ir,i] += xx[i,ir,iss]
+			end
+			# mixing matrix (wrong!!!)
+			A[ir,iss]=var(xx[:,ir,iss])
+		end
+	end
+
+	ica = ica_func(xstack, ns), complex.(A)
+	ica=ica[1]
+
+	fastica!(ica)
+
+	s=transpose(ica.s)
+
+	xx=irfft(s, nt, [1])
+
+
+	return xx
+
+end
+"""
+`ns`	: 
+`dat`	: dat
+
+
+"""
 function ICA(x,
 	     ns;
 	     maxiter::Int=1000,
@@ -57,9 +114,9 @@ function ICA(x,
 	     )
 
 	T = eltype(x)
+	nr, nt = size(x)
 
 	# check input arguments
-	nr, nt = size(x)
 	(nt < 1) && error("there must be more than one samples, i.e. nt > 1.")
 	(ns > nr) && error("ns must not exceed nr")
 
@@ -68,12 +125,18 @@ function ICA(x,
 
 
 	# bins
-	bindices=[round(Int, s) for s in linspace(1,nt,nbins+1)]
+	bindices=[round(Int, s) for s in linspace(0,nt,nbins+1)]
 	bins=Array{UnitRange{Int64}}(nbins)
 	for ib in 1:nbins           
-		bins[ib]=bindices[ib]:bindices[ib+1]
+		bins[ib]=bindices[ib]+1:bindices[ib+1]
 	end
 
+	println("FastICA\t")
+	println("===================")
+	println("total samples\t",nt)
+	println("total number of bins\t",nbins)
+	println("average samples in each bin\t",round(Int,mean(length.(bins))))
+	println("")
 
 	# allocating vectors, that store G, g, and dg
 	GWx = Matrix{T}(ns, nt)
@@ -94,8 +157,8 @@ function ICA(x,
 
 	(T == Float64) ? attrib=:real : attrib=:complex
 
-	ica=ICA(x, xhat, s, ns, nr, nt, GWx, gWx, dgWx, Q, W, Wp, mv, attrib, 
-	 maxiter, tol, bins)
+	ica=ICA(x, xhat, s, ns, nr, nt, GWx, gWx, dgWx, Q, W, Wp, mv, attrib,
+	 maxiter, 1, tol, bins)
 
 	unmixing_initialize!(ica, Win)
 
@@ -271,9 +334,9 @@ function fastica!(ica::ICA; verbose::Bool=false, A=nothing)
 		end
 	end
 
-	fix_scaling!(W, bins)
+	fix_permutation!(W, EG)
 
-	fix_permutation!(W, EG, bins)
+	fix_scaling!(ica)
 
 	# store error in the unmixing matrix -- only for testing (commented)
 	SSE = (!(A === nothing)) ? error_unmixing(ica, A) : zeros(nbins)
@@ -289,6 +352,7 @@ function error_unmixing(ica, A)
 	nbins=length(ica.bins)     
 	Q=ica.Q        
 	W=ica.W        
+	SSE=zeros(nbins)
 	for ib=1:nbins                 
 		QQ=view(Q,:,:,ib)                 
 		WW=view(W,:,:,ib)                 
@@ -297,25 +361,76 @@ function error_unmixing(ica, A)
 	return SSE
 end
 
-function fix_scaling!(W, bins, magic_recv)
-	nbins=length(bins)
-	for ib in 1:nbins
+"""
+compute the distance between s and 
+* `s` actual source matrix [nt, ns]
+* `ica` ica output s is used
 
-		WW = transpose(W[:,:,ib]);
-		A = inv(WW);
-		A[:,1] /= A[magic_recv,1];
-		A[:,2] /= A[magic_recv,2];
-		W[:,:,ib] = transpose(inv(A));
+There is still global permutation 
+and scaling to be fixed.
+"""
+function error_after_ica(ica, s)
+	(size(s) ≠ size(ica.s)) && error("dimension")
+	
+	errr=zeros(size(s,1))
+
+	for is in 1:2
+		ss0=view(s,is,:)
+		err=zeros(size(s,1))
+		for is1 in 1:2
+			ss=view(ica.s,is1,:)
+			err[is1] = Misfits.error_after_scaling(ss,ss0)[1]
+		end
+		errr[is] = minimum(err)
+	end
+	return errr
+end
+
+"""
+Minimum Distortion Principle.
+This method is not yet memory optimized.
+Performs ICA for convolutive mixtures.
+# Arguments
+# Output
+* deblended data at `magic_recv`
+"""
+function fix_scaling!(ica)
+	nbins=length(ica.bins)
+	ns=ica.ns
+	W=ica.W
+	Q=ica.Q
+	WQ=zeros(eltype(W),size(W,1),size(W,2))
+	for ib in 1:nbins
+		WW=view(W,:,:,ib)
+		QQ=view(Q,:,:,ib)
+
+		Ac_mul_Bc!(WQ, WW, QQ)
+		# A is the mixing matrix
+		A = inv(WQ);
+
+		# normalize mixing matrix, w.r.t. magic_recv
+		A[:,1] /= A[ica.magic_recv,1];
+		A[:,2] /= A[ica.magic_recv,2];
+
+	 	copy!(WQ, (inv(A)));
+		
+		# scalings are only put in WW, so using inv(QQ)
+		copy!(WW, inv(QQ)*WQ')
 	end
 end
 
-function fix_permutation!(s, EG, bins)
-	nbins=length(bins)
+"""
+Order the components according to the EG values.
+EG measures Gaussianity and hence, we are ordering sources 
+in each bin according to their distance from Gaussian.
+"""
+function fix_permutation!(W, EG)
+	nbins=size(W,3)
 	for ib=1:nbins
-		ss=view(s,:,bins[ib])
+		WW=view(W,:,:,ib)
 		# permutation order
 		ord = sortperm(EG[:,ib]; rev=true)
-		copy!(ss, ss[ord,:])
+		copy!(WW, WW[:,ord])
 	end
 end
 
@@ -417,8 +532,6 @@ function symmetric_decorrelation!(W)
 	end
 end
 
-
-
 """
 Compute the error in the unmixing matrix.
 
@@ -442,266 +555,10 @@ function error_scale_perm{T}(x::Matrix{T}, y::Matrix{T})
 end
 
 
-"""
-Performs ICA for convolutive mixtures.
-# Arguments
-* `magic_recv`: a receiver index, where deblending is performed
-* `recv_n`: total number of receivers
-* `src_n`: total number of sources
-* `grid`: `M1D` grid
-* `nband`: number of frequency bins, where ICA is performed
-* `nsubfac`: overlap factor (testing)
-* `X`: blended data
-
-# Output
-* `Y`: deblended data at `magic_recv`
-"""
-function bica(;
-	magic_recv::Int64=1,
-	recv_n::Int64=1,
-	src_n::Int64=1,
-	grid::M1D=M1D(:samp1),
-	nband::Int64=1, # number of bands 
-	nsubfac::Int64=1, #
-	X::Array{Float64}=zeros(grid.nx,recv_n) # data 
-            	)
-
-nband >= div(grid.nx,2) ? error("too many bands") :
-nb = (mod(grid.nx, nband) == 0) ? div(grid.nx, nband) : error("change nsamples");
-
-nbandtot = (nsubfac-1) * (nband-1) + nband
-# initialize
-Yband = zeros(src_n,nb)
-Xband = zeros(recv_n,nb,nbandtot)
-Mband = Array(ICA, nbandtot)
-
-# divide into bands and do ICA in each band
-for iband = 1: nbandtot
-	# indices for bands
-	ixmin = (iband-1) * div(nb,nsubfac) + 1
-	ixmax = nb + (iband-1) * div(nb,nsubfac)
-
-#	println("fffffff\t", ixmin, "\t", ixmax)
-
-	# window out the data in the band
-	Xband[:,:,iband] = transpose(X[ixmin:ixmax,:]);
-
-	# do ICA
-	Mband[iband] = ica(Xband[:,:,iband], src_n; 
-	     do_whiten=true, fun=icagfun(:gaus), verbose=false, maxiter=200,
-	     tol=1e-20, winit=ones(src_n,src_n))
-
-	# calculate source signals temporarily
-	Yband = transform(Mband[iband],Xband[:,:,iband]);
-
-	# fix permutation problem
-	Mband[iband].W = kurtosis(Yband[1,:]) < kurtosis(Yband[2,:]) ? 
-			Mband[iband].W : Mband[iband].W[:,2:-1:1];
-
-			#println("kurtosis 1\t", kurtosis(Yband[1,:]))
-			#println("kurtosis 2\t", kurtosis(Yband[2,:]))
-end
-
-Yall = zeros(src_n,grid.nx);
-Ybandprev = zeros(src_n,nb);
-Yband = zeros(src_n,nb)
-ixcmin  = 1
-ixcmax  = nb - div(nb,nsubfac)
-ixcumin = nb - div(nb,nsubfac) + 1
-ixcumax = nb
-ixcpmin = div(nb,nsubfac) + 1
-ixcpmax = nb
-for iband = 1: nbandtot 
-	# indices of full band
-	ixmin = (iband-1) * div(nb,nsubfac) + 1;
-	ixmax = nb + (iband-1) * div(nb,nsubfac);
-
-	# indices of the update zone that has no overlap
-	ixminupdate = ixmax-div(nb,nsubfac)+1;
-	ixmaxupdate = ixmax;
-
-
-	Mbandtemp = Mband[iband];
-
-	# minimum distortion principle -- implementation 1
-#	WI = inv(Mbandtemp.W);
-#	Mbandtemp.W *= diagm([WI[1,magic_recv],WI[2,magic_recv]]);
-
-
-	# minimum distortion principle -- implementation 2
-	W = transpose(Mbandtemp.W);
-	A = inv(W);
-	A[:,1] /= A[magic_recv,1];
-	A[:,2] /= A[magic_recv,2];
-	Mbandtemp.W = transpose(inv(A));
-
-
-
-	#Mbandtemp.W[:,1] /= norm(Mbandtemp.W[:,1])
-	#Mbandtemp.W[:,2] /= norm(Mbandtemp.W[:,2])
-
-	# temporarily compute Yband 
-	Yband = transform(Mbandtemp,Xband[:,:,iband]); 
-
-	# normalize
-#	Yband[1,:] /= norm(Yband[1,:])
-#	Yband[2,:] /= norm(Yband[2,:])
-
-	# update Yband 
-	if((isequal(iband,1)) | (isequal(nsubfac,1)))
-		Yall[1,ixmin:ixmax] = Yband[1,:];
-		Yall[2,ixmin:ixmax] = Yband[2,:];
-
-		# normalize
-	#	Yall[1,ixmin:ixmax] /= norm(Yall[1,ixmin:ixmax])
-#		Yall[2,ixmin:ixmax] /= norm(Yall[2,ixmin:ixmax])
-
-	else
-		# estimate scalars
-
-		err1, sc1 = Misfits.error_after_scaling(Yband[1,ixcmin:ixcmax], Ybandprev[1,ixcpmin:ixcpmax])
-		err2, sc2 = Misfits.error_after_scaling(Yband[2,ixcmin:ixcmax], Ybandprev[2,ixcpmin:ixcpmax])
-
-		println("FFFF", err1, "\t",err2,"\t",sc1, "\t", sc2)
-		# actual update
-		Yall[1,ixminupdate:ixmaxupdate] = Yband[1,ixcumin:ixcumax] * sc1 ;
-		Yall[2,ixminupdate:ixmaxupdate] = Yband[2,ixcumin:ixcumax] * sc2 ;
-
-		# normalize after update
-#		Yall[1,ixminupdate:ixmaxupdate] /= norm(Yall[1,ixminupdate:ixmaxupdate])
-#		Yall[2,ixminupdate:ixmaxupdate] /= norm(Yall[2,ixminupdate:ixmaxupdate])
-
-	end
-	
-	# save Yprev
-	Ybandprev[1,:] = Yall[1,ixmin:ixmax];
-	Ybandprev[2,:] = Yall[2,ixmin:ixmax];
-
-end
-
-
-
-#	# fix scaling problem using previous band
-#	if((isequal(iband,1)) | (isequal(nsubfac,1)))
-#		Mbandtemp = Mband[iband];
-#
-#		# minimum distortion principle 
-#		WI = inv(Mbandtemp.W);
-##		Mbandtemp.W *= diagm([WI[1,magic_recv],WI[2,magic_recv]]);
-#if(!isequal(nsubfac,1))
-#		Mbandtemp.W[:,1] /= norm(Mbandtemp.W[:,1])
-#		Mbandtemp.W[:,2] /= norm(Mbandtemp.W[:,2])
-#
-#end
-#
-#		# final λbandtemp after fixing scaling and permutation
-#		Yband = (transform(Mbandtemp,Xband[:,:,iband]));
-#
-#if(!isequal(nsubfac,1))
-#	Yband[1,:] /= norm(Yband[1,:])
-#	Yband[2,:] /= norm(Yband[2,:])
-#end
-#		Yall[:,ixmin:ixmax] = Yband[:,:];
-#
-#
-#	else
-#		λ = [dot(Ybandprev[1,ixcpmin:ixcpmax],Yband[1,ixcmin:ixcmax])/
-#		     dot(Yband[1,ixcmin:ixcmax],    Yband[1,ixcmin:ixcmax]),
-#		     dot(Ybandprev[2,ixcpmin:ixcpmax],Yband[2,ixcmin:ixcmax])/
-#		     dot(Yband[2,ixcmin:ixcmax],    Yband[2,ixcmin:ixcmax])]
-#
-#		err1, sc1 =	Misfits.error_after_scaling(Yband[1,ixcmin:ixcmax], Ybandprev[1,ixcpmin:ixcpmax])
-#		err2, sc2 =	Misfits.error_after_scaling( Yband[2,ixcmin:ixcmax], Ybandprev[2,ixcpmin:ixcpmax] )
-#		println("GJJEHFFE", λ)
-#		println(err1,"\t",sc1)
-#		println(err2,"\t",sc2)
-#
-##		λ /= div(nb,nsubfac);
-#		Mbandtemp = Mband[iband];
-##		println(λ)
-##		println("before corr", Mbandtemp.W, iband)
-#		Mbandtemp.W = Mbandtemp.W * diagm(λ);
-#		Mbandtemp.W[:,1] /= norm(Mbandtemp.W[:,1])
-#		Mbandtemp.W[:,2] /= norm(Mbandtemp.W[:,2])
-#		#Mbandtemp.W = Mbandtemp.W * diagm(λ./abs(λ));
-#
-#		#println("update in ",ixmax-div(nb,nsubfac)+1, "\t",ixmax)
-#		#println("common ",ixcpmin,"\t", ixcpmax,"\t", ixcmin,"\t", ixcmax,"\t")
-#
-#		# final λbandtemp after fixing scaling and permutation
-#		Yband = (transform(Mbandtemp,Xband[:,:,iband]));
-#
-#
-#
-#	Yall[1,ixmax-div(nb,nsubfac)+1: ixmax] = Yband[1,nb - div(nb,nsubfac) + 1:nb] * λ[1] ;
-#	Yall[2,ixmax-div(nb,nsubfac)+1: ixmax] = Yband[2,nb - div(nb,nsubfac) + 1:nb] * λ[2] ;
-#
-#if(!isequal(nsubfac,1))
-#	Yband[1,:] /= norm(Yband[1,:])
-#	Yband[2,:] /= norm(Yband[2,:])
-#end
-#
-#	end
-#	println("after correc",Mbandtemp.W, iband)
-
-#	Ybandprev = Yband;
-#end
-
-
-
-
-return reshape(Yall, (src_n,grid.nx))
-end
-
-
 
 """
-Convolutive mixing in the frequency domain.
-
-# Arguments
-* `As`:
-* `Ab`:
-* `B`:
-* `S`:
-* `fgrid`:
-
-# Outputs
-* `D`
-* `d`
-* `Ds`
-* `ds`
-* `Db`
-* `db`
+Whiten the data that are input to ICA. Whietning matrix is stored in `Q`.
 """
-function exact_freq_mixing(;
-			   As::Array{Complex{Float64}}=nothing,
-			   Ab::Array{Complex{Float64}}=nothing,
-			   B::Array{Complex{Float64}}=nothing,
-			   S::Array{Complex{Float64}}=nothing, 
-			   fgrid::M1D=nothing
-			  )
-	recv_n = size(Ab,2)
-	D = fill(complex(0.0,0.0),fgrid.nx,recv_n); 
-	d = fill(complex(0.0,0.0),fgrid.nx,recv_n);
-	Ds = fill(complex(0.0,0.0),fgrid.nx,recv_n); 
-	ds = fill(complex(0.0,0.0),fgrid.nx,recv_n);
-	Db = fill(complex(0.0,0.0),fgrid.nx,recv_n); 
-	db = fill(complex(0.0,0.0),fgrid.nx,recv_n);
-	for ir = 1:recv_n
-		for iff = 1:fgrid.nx
-			D[iff, ir] = Ab[iff, ir] * B[iff] + As[iff, ir] * S[iff]
-			Db[iff, ir] = Ab[iff, ir] * B[iff] 
-			Ds[iff, ir] = As[iff, ir] * S[iff]
-		end
-		d[:, ir] = ifft(D[:, ir])
-		db[:, ir] = ifft(Db[:, ir])
-		ds[:, ir] = ifft(Ds[:, ir])
-	end
-	return D, d, Ds, ds, Db, db
-end
-
-
-
 function do_whiten!(ica::ICA)
     nr = ica.nr
     for ib in 1:length(ica.bins)
@@ -720,10 +577,10 @@ function do_whiten!(ica::ICA)
 	    ord = sortperm(Efac.values; rev=true)
 	    v, P = Efac.values[ord], Efac.vectors[:, ord]
 	    # whitening matrix
-	    copy!(Q, scale!(P, sqrt.(inv.(v))))
+	    copy!(Q, scale!(P, sqrt.(inv.((v)))))
 
 	    # for testing --  this should be a diagonal matrix
-	    #println(W0' * C * W0)
+	    #println(Q' * C * Q)
 	    Ac_mul_B!(xhat, Q, x)
     end
     return ica.Q
